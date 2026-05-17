@@ -442,6 +442,10 @@ dim_device_slim = dim_device.select(
 
 silver_fact_transactions_enriched = (
     silver_fact_transactions_clean
+    # Bronze carries a denormalized merchant_category from upstream — drop it so
+    # the LEFT join below brings in the authoritative value from dim_merchant
+    # without causing AMBIGUOUS_REFERENCE on later projections.
+    .drop("merchant_category")
     .join(F.broadcast(dim_customer_slim), on="customer_id", how="left")
     .join(F.broadcast(dim_merchant_slim), on="merchant_id", how="left")
     .join(F.broadcast(dim_device_slim), on="device_id", how="left")
