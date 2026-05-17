@@ -739,3 +739,299 @@ fk_bounds.show(truncate=False)
 # MAGIC - Bloom filter indexes on `merchant_id` and `device_id`
 # MAGIC - Photon enablement for ~3–5× speedup on these aggregation patterns
 # MAGIC - Unity Catalog row-level filters for PII (`ip_address`, `customer_id`)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # Bronze: Inject realistic raw-data quality issues
+# MAGIC
+# MAGIC Real ingestion landing zones contain duplicates, nulls, sentinels, future
+# MAGIC timestamps, late events, and orphan FKs. Models trained or rules tested on
+# MAGIC the clean `fact_transactions` will fail in production. We derive
+# MAGIC `bronze_fact_transactions_dirty` from the clean fact and inject reproducible
+# MAGIC issues.
+# MAGIC
+# MAGIC ## Strategy
+# MAGIC
+# MAGIC Each transaction is assigned a deterministic **issue bucket** in `[0, 9999]`
+# MAGIC via `pmod(hash(transaction_id, "issue"), 10000)`. Disjoint bucket ranges
+# MAGIC map to disjoint issue types, so:
+# MAGIC
+# MAGIC - **No double-tagging.** Each row gets exactly one issue type (or `clean`).
+# MAGIC - **Reproducibility.** Same `transaction_id` → same issue across runs.
+# MAGIC - **Distribution control.** Bucket-range width = % of rows for that issue.
+# MAGIC
+# MAGIC `data_quality_issue_type` is set in lock-step with the mutated columns. The
+# MAGIC Silver step **does not trust** this label — it re-derives the verdict from
+# MAGIC the data itself; the label only verifies cleaning recall.
+
+# COMMAND ----------
+
+# Read the clean fact table generated above.
+fact_clean = spark.table(f"{DB_NAME}.fact_transactions")
+
+# Add ingestion_ts: when the transaction *arrived* in the warehouse. For most
+# rows this is transaction_ts + a small random delay (0..600 seconds). The
+# `late_event` bucket below overrides this. rand(seed=...) keeps it reproducible.
+bronze_base = (
+    fact_clean
+    .withColumn(
+        "_issue_bucket",
+        F.pmod(F.hash(F.col("transaction_id"), F.lit("issue")), F.lit(10000)),
+    )
+    .withColumn(
+        "ingestion_ts",
+        F.col("transaction_ts")
+        + F.expr("make_interval(0, 0, 0, 0, 0, 0, cast(rand(7001) * 600 as bigint))"),
+    )
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Bucket → issue mapping
+# MAGIC
+# MAGIC | Buckets | Width | Issue type | Production analogue |
+# MAGIC |---|---|---|---|
+# MAGIC | 0–19 | 0.20% | `null_customer` | Token decode failure on legacy ATM stream |
+# MAGIC | 20–39 | 0.20% | `null_merchant` | Acquirer feed missing MID for new sign-ups |
+# MAGIC | 40–59 | 0.20% | `null_device` | Web channel — no device fingerprint captured |
+# MAGIC | 60–89 | 0.30% | `null_amount` | Partial settlement message before posting |
+# MAGIC | 90–119 | 0.30% | `negative_amount` | Refund/reversal mis-routed as txn |
+# MAGIC | 120–139 | 0.20% | `invalid_currency` | Cross-network message with corrupted ISO code |
+# MAGIC | 140–159 | 0.20% | `future_timestamp` | Mis-set acquirer clock / TZ bug |
+# MAGIC | 160–179 | 0.20% | `orphan_customer` | Race: txn before customer onboarding lands |
+# MAGIC | 180–199 | 0.20% | `orphan_merchant` | New merchant onboarded mid-batch |
+# MAGIC | 200–249 | 0.50% | `late_event` | Offline POS terminal syncing on reconnect |
+# MAGIC | 250–259 | 0.10% | `zero_amount` | $0 pre-auth leaking into settlement feed |
+# MAGIC | 260–279 | 0.20% | `invalid_status` | New upstream status code outside our enum |
+# MAGIC | 280–299 | 0.20% | `suspicious_default` | Sentinels: 0 / -1 / "UNKNOWN" |
+# MAGIC | 300–319 | 0.20% | `null_country` | IP-to-country lookup timed out |
+# MAGIC | 320+ | ~96.8% | `clean` | Healthy rows |
+
+# COMMAND ----------
+
+# Build the issue label as a single Catalyst CASE WHEN expression. Python is
+# only used to compose the column tree; evaluation is per-row on executors.
+issue_label = (
+    F.when((F.col("_issue_bucket") >= 0)   & (F.col("_issue_bucket") < 20),  F.lit("null_customer"))
+     .when((F.col("_issue_bucket") >= 20)  & (F.col("_issue_bucket") < 40),  F.lit("null_merchant"))
+     .when((F.col("_issue_bucket") >= 40)  & (F.col("_issue_bucket") < 60),  F.lit("null_device"))
+     .when((F.col("_issue_bucket") >= 60)  & (F.col("_issue_bucket") < 90),  F.lit("null_amount"))
+     .when((F.col("_issue_bucket") >= 90)  & (F.col("_issue_bucket") < 120), F.lit("negative_amount"))
+     .when((F.col("_issue_bucket") >= 120) & (F.col("_issue_bucket") < 140), F.lit("invalid_currency"))
+     .when((F.col("_issue_bucket") >= 140) & (F.col("_issue_bucket") < 160), F.lit("future_timestamp"))
+     .when((F.col("_issue_bucket") >= 160) & (F.col("_issue_bucket") < 180), F.lit("orphan_customer"))
+     .when((F.col("_issue_bucket") >= 180) & (F.col("_issue_bucket") < 200), F.lit("orphan_merchant"))
+     .when((F.col("_issue_bucket") >= 200) & (F.col("_issue_bucket") < 250), F.lit("late_event"))
+     .when((F.col("_issue_bucket") >= 250) & (F.col("_issue_bucket") < 260), F.lit("zero_amount"))
+     .when((F.col("_issue_bucket") >= 260) & (F.col("_issue_bucket") < 280), F.lit("invalid_status"))
+     .when((F.col("_issue_bucket") >= 280) & (F.col("_issue_bucket") < 300), F.lit("suspicious_default"))
+     .when((F.col("_issue_bucket") >= 300) & (F.col("_issue_bucket") < 320), F.lit("null_country"))
+     .otherwise(F.lit("clean"))
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Apply mutations
+# MAGIC
+# MAGIC Tag the issue type first, then mutate columns in lock-step. Each `withColumn`
+# MAGIC is a single Catalyst project — the planner fuses them into one stage.
+
+# COMMAND ----------
+
+bronze_mutated = (
+    bronze_base
+    .withColumn("data_quality_issue_type", issue_label)
+
+    # ---------- Nulls / sentinels in critical FKs ----------
+    # A null customer_id silently short-circuits fraud rules like
+    # `txn_country != home_country` to NULL — hiding cross-border fraud.
+    .withColumn(
+        "customer_id",
+        F.when(F.col("data_quality_issue_type") == "null_customer", F.lit(None).cast("long"))
+         # Sentinel 0 from legacy systems = "unknown customer". Same effect as NULL
+         # for risk scoring, but tracking the distinction helps prioritize fixes.
+         .when(F.col("data_quality_issue_type") == "suspicious_default", F.lit(0).cast("long"))
+         .otherwise(F.col("customer_id")),
+    )
+    .withColumn(
+        "merchant_id",
+        F.when(F.col("data_quality_issue_type") == "null_merchant", F.lit(None).cast("long"))
+         # -1 sentinel: classic "unknown merchant" placeholder from older mainframes.
+         .when(F.col("data_quality_issue_type") == "suspicious_default", F.lit(-1).cast("long"))
+         .otherwise(F.col("merchant_id")),
+    )
+    .withColumn(
+        "device_id",
+        F.when(F.col("data_quality_issue_type") == "null_device", F.lit(None).cast("long"))
+         .otherwise(F.col("device_id")),
+    )
+    .withColumn(
+        "transaction_country",
+        F.when(F.col("data_quality_issue_type") == "null_country", F.lit(None).cast("string"))
+         # "UNKNOWN" placeholder — must be standardized to NULL in Silver.
+         .when(F.col("data_quality_issue_type") == "suspicious_default", F.lit("UNKNOWN"))
+         .otherwise(F.col("transaction_country")),
+    )
+
+    # ---------- Amount issues ----------
+    # Amount drives every velocity rule. Negatives invert velocity scores; zeros
+    # pollute customer-baseline averages used as ML features.
+    .withColumn(
+        "amount",
+        F.when(F.col("data_quality_issue_type") == "null_amount", F.lit(None).cast("double"))
+         # Negative: flip the sign so the magnitude stays realistic.
+         .when(F.col("data_quality_issue_type") == "negative_amount", -F.col("amount"))
+         # Zero: simulates a $0 pre-auth leaking into the settlement feed.
+         .when(F.col("data_quality_issue_type") == "zero_amount", F.lit(0.0))
+         .otherwise(F.col("amount")),
+    )
+
+    # ---------- Currency / status standardization issues ----------
+    # Invalid ISO codes break FX normalization; out-of-enum statuses can be
+    # incorrectly counted as APPROVED in fraud-loss reporting.
+    .withColumn(
+        "currency",
+        F.when(F.col("data_quality_issue_type") == "invalid_currency", F.lit("XXX"))
+         .otherwise(F.col("currency")),
+    )
+    .withColumn(
+        "transaction_status",
+        F.when(F.col("data_quality_issue_type") == "invalid_status", F.lit("UNKNOWN_BAD"))
+         .otherwise(F.col("transaction_status")),
+    )
+
+    # ---------- Timestamp anomalies ----------
+    # Future timestamps poison time-windowed aggregations: one 2099-dated row
+    # makes 24h velocity counts span 70+ years. Late events arriving after the
+    # model has already scored cause feature/score drift.
+    .withColumn(
+        "ingestion_ts",
+        # Late events: ingestion 3..10 days *after* transaction. Day offset is
+        # deterministic via hash so reruns produce the same lateness.
+        F.when(
+            F.col("data_quality_issue_type") == "late_event",
+            F.col("transaction_ts")
+            + F.expr("make_interval(0, 0, 0, "
+                     "cast(3 + pmod(hash(transaction_id, 'late'), 8) as int), "
+                     "0, 0, 0)"),
+        ).otherwise(F.col("ingestion_ts")),
+    )
+    .withColumn(
+        "transaction_ts",
+        # Future timestamps push *transaction_ts* (not ingestion_ts) forward —
+        # that's the realistic shape: source clock bug, not warehouse bug.
+        F.when(
+            F.col("data_quality_issue_type") == "future_timestamp",
+            F.col("transaction_ts")
+            + F.expr("make_interval(0, 0, 0, "
+                     "cast(30 + pmod(hash(transaction_id, 'future'), 90) as int), "
+                     "0, 0, 0)"),
+        ).otherwise(F.col("transaction_ts")),
+    )
+
+    # ---------- Orphan FKs ----------
+    # A customer_id outside dim_customer can't be enriched with risk_tier. An
+    # inner-join silently drops the row (masking attacks); a left-join produces
+    # NULL features the model treats as "low risk by default". Push outside the
+    # dim range deliberately so the bug is impossible to miss.
+    .withColumn(
+        "customer_id",
+        F.when(
+            F.col("data_quality_issue_type") == "orphan_customer",
+            F.lit(N_CUSTOMERS) + F.lit(1)
+            + F.pmod(F.hash(F.col("transaction_id"), F.lit("orph_c")), F.lit(1_000_000)),
+        ).otherwise(F.col("customer_id")),
+    )
+    .withColumn(
+        "merchant_id",
+        F.when(
+            F.col("data_quality_issue_type") == "orphan_merchant",
+            F.lit(N_MERCHANTS) + F.lit(1)
+            + F.pmod(F.hash(F.col("transaction_id"), F.lit("orph_m")), F.lit(100_000)),
+        ).otherwise(F.col("merchant_id")),
+    )
+    .drop("_issue_bucket")
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Inject duplicates (extra rows, not mutated values)
+# MAGIC
+# MAGIC Duplicates need real extra rows — payment networks legitimately re-emit
+# MAGIC messages on retries. We take ~2% of rows, stamp them as `duplicate`, bump
+# MAGIC `ingestion_ts` forward by 60–3600 seconds, and union them on. Both rows
+# MAGIC share the same `transaction_id` — the Silver dedup must keep the *first*
+# MAGIC arrival (which is the auth message; later messages are clearing/settlement,
+# MAGIC and fraud decisioning runs at auth time).
+
+# COMMAND ----------
+
+DUP_SHARE_PCT = 2  # 2% — within the requested 1–3% band
+
+duplicates = (
+    bronze_mutated
+    .where(F.pmod(F.hash(F.col("transaction_id"), F.lit("dup")), F.lit(100)) < F.lit(DUP_SHARE_PCT))
+    .withColumn("data_quality_issue_type", F.lit("duplicate"))
+    .withColumn(
+        "ingestion_ts",
+        F.col("ingestion_ts")
+        + F.expr("make_interval(0, 0, 0, 0, 0, 0, "
+                 "cast(60 + pmod(hash(transaction_id, 'dupoff'), 3540) as bigint))"),
+    )
+)
+
+bronze_dirty = bronze_mutated.unionByName(duplicates)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Persist Bronze
+
+# COMMAND ----------
+
+(
+    bronze_dirty.write
+    .format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .partitionBy("event_date")
+    .saveAsTable(f"{DB_NAME}.bronze_fact_transactions_dirty")
+)
+
+print("Bronze issue-type distribution (groupBy reduce — never a full collect):")
+(
+    spark.table(f"{DB_NAME}.bronze_fact_transactions_dirty")
+    .groupBy("data_quality_issue_type")
+    .count()
+    .orderBy(F.desc("count"))
+    .show(20, truncate=False)
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Sample dirty rows + schema
+
+# COMMAND ----------
+
+print("=" * 80)
+print("bronze_fact_transactions_dirty — schema & sample")
+print("=" * 80)
+spark.table(f"{DB_NAME}.bronze_fact_transactions_dirty").printSchema()
+
+# Show one example of each issue type. groupBy + first() is a reduce — safe.
+print("One sample row per issue type:")
+(
+    spark.table(f"{DB_NAME}.bronze_fact_transactions_dirty")
+    .select("transaction_id", "customer_id", "merchant_id", "device_id",
+            "amount", "currency", "transaction_country", "transaction_status",
+            "transaction_ts", "ingestion_ts", "data_quality_issue_type")
+    .where(F.col("data_quality_issue_type") != "clean")
+    .orderBy("data_quality_issue_type", "transaction_id")
+    .dropDuplicates(["data_quality_issue_type"])
+    .show(20, truncate=False)
+)
