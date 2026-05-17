@@ -52,13 +52,21 @@ from pyspark.sql.types import (
 spark = SparkSession.builder.getOrCreate()
 
 # Adaptive Query Execution handles skew automatically by splitting heavy partitions
-# during shuffles. We turn it on explicitly so this notebook works on older clusters.
-spark.conf.set("spark.sql.adaptive.enabled", "true")
-spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
-spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
+# during shuffles. On Databricks Serverless / Unity Catalog shared compute these
+# confs are platform-managed and AQE is already on by default, so attempting to set
+# them raises CONFIG_NOT_AVAILABLE (SQLSTATE 42K0I). We try-set and ignore failures
+# so the notebook runs unchanged on classic clusters, serverless, and DBR ≥ 7.3.
+def _try_set(key: str, value: str) -> None:
+    try:
+        spark.conf.set(key, value)
+    except Exception:
+        # Serverless blocks user-level conf changes — that's fine, defaults are right.
+        pass
 
-# Default shuffle partition count. AQE will coalesce/split as needed.
-spark.conf.set("spark.sql.shuffle.partitions", "400")
+_try_set("spark.sql.adaptive.enabled", "true")
+_try_set("spark.sql.adaptive.skewJoin.enabled", "true")
+_try_set("spark.sql.adaptive.coalescePartitions.enabled", "true")
+_try_set("spark.sql.shuffle.partitions", "400")
 
 # COMMAND ----------
 
