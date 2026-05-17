@@ -304,8 +304,18 @@ bronze_deduped = (
     .drop("_dup_count")
 )
 
-# Cache because we'll filter twice (clean side and quarantine side).
-bronze_deduped = bronze_deduped.cache()
+# Cache because we'll filter twice (clean side and quarantine side). On Databricks
+# Serverless, .cache() raises NOT_SUPPORTED_WITH_SERVERLESS — Serverless has its
+# own disk/result caching (Photon), so the try/except keeps the notebook portable.
+def _try_cache(df):
+    try:
+        return df.cache()
+    except Exception:
+        # Serverless path — return the DataFrame unchanged; the planner reuses
+        # results within the same query and Photon caches the read at storage.
+        return df
+
+bronze_deduped = _try_cache(bronze_deduped)
 
 # COMMAND ----------
 
@@ -597,8 +607,12 @@ silver_data_quality_summary = summary_scalars.crossJoin(flag_counts)
     .saveAsTable(f"{DB_NAME}.silver_data_quality_summary")
 )
 
-# Release the cache now that all writes are committed.
-bronze_deduped.unpersist()
+# Release the cache now that all writes are committed. unpersist() is a no-op
+# (and may also raise) on serverless where cache() was skipped — guard it.
+try:
+    bronze_deduped.unpersist()
+except Exception:
+    pass
 
 # COMMAND ----------
 
