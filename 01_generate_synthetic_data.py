@@ -611,20 +611,52 @@ fact_transactions = (
 
 # COMMAND ----------
 
-(
-    fact_transactions.write
-    .format("delta")
-    .mode("overwrite")
-    .option("overwriteSchema", "true")
-    .partitionBy("event_date")
-    .saveAsTable(f"{DB_NAME}.fact_transactions")
-)
+# Use Liquid Clustering on the fact table (DBR 15.2+). Why Liquid over partitioning:
+#   - No partition column lock-in: cluster keys can be changed with ALTER TABLE
+#     and the next OPTIMIZE re-clusters incrementally — no full rewrite.
+#   - No small-file problem: Liquid auto-sizes files regardless of skew across
+#     event_date / customer_id values.
+#   - Better at high cardinality (1M customers, 100k merchants) than Z-ORDER.
+#   - Incremental OPTIMIZE re-clusters only new/changed data.
+# We try clusterBy first; on older runtimes that don't support it we fall back
+# to the classic partition-by-date + Z-ORDER pattern.
+def _write_fact_liquid_or_partitioned(df, table: str, cluster_cols: list[str]) -> None:
+    try:
+        # DBR 15.2+ — Liquid Clustering. clusterBy on the DataFrameWriter sets
+        # the cluster keys at table creation time.
+        (
+            df.write
+            .format("delta")
+            .mode("overwrite")
+            .option("overwriteSchema", "true")
+            .clusterBy(*cluster_cols)
+            .saveAsTable(f"{DB_NAME}.{table}")
+        )
+        # Trigger initial clustering. Liquid tables require OPTIMIZE to actually
+        # cluster — clusterBy on write only declares the intent.
+        spark.sql(f"OPTIMIZE {DB_NAME}.{table}")
+        print(f"{table}: written with Liquid Clustering on {cluster_cols}")
+    except Exception as e:
+        # Fallback path: partition by event_date, Z-ORDER on the remaining keys.
+        # event_date must be excluded from the ZORDER list (it's the partition key).
+        print(f"Liquid Clustering not available ({e}); falling back to partition + ZORDER")
+        (
+            df.write
+            .format("delta")
+            .mode("overwrite")
+            .option("overwriteSchema", "true")
+            .partitionBy("event_date")
+            .saveAsTable(f"{DB_NAME}.{table}")
+        )
+        zorder_cols = ", ".join(c for c in cluster_cols if c != "event_date")
+        if zorder_cols:
+            _try_zorder(table, zorder_cols)
 
-# Z-ORDER fact_transactions on (customer_id, merchant_id) within each event_date
-# partition. Most fraud queries filter by date first (partition pruning) and then
-# by customer or merchant — clustering on those keys cuts file reads dramatically.
-# event_date is the partition column and must NOT appear in the ZORDER list.
-_try_zorder("fact_transactions", "customer_id, merchant_id")
+_write_fact_liquid_or_partitioned(
+    fact_transactions,
+    "fact_transactions",
+    ["event_date", "customer_id", "merchant_id"],
+)
 
 # COMMAND ----------
 
