@@ -460,50 +460,77 @@ for table_name, df in GOLD_TABLES:
 
 # COMMAND ----------
 
-# Use display() if running on Databricks, else show(). This is a Python-side
-# capability check, not a row-level operation.
+# Each Gold table goes in its OWN cell with a direct display(df) call. The
+# chart toolbar in Databricks attaches to a cell whose last expression is a
+# direct display(...) — aliased calls (e.g. _DISPLAY = display) don't trigger
+# the chart UI, which is why earlier the icon was missing.
+#
+# Outside Databricks, `display` isn't defined; the safe fallback below makes the
+# notebook still importable, and each chart cell will show a tabular .show()
+# instead. Comment out the fallback if you want a hard failure off-platform.
 try:
     display  # type: ignore[name-defined]
-    _DISPLAY = display  # noqa: F821
 except NameError:
-    def _DISPLAY(df, n: int = 50):
+    def display(df, n: int = 50):  # type: ignore[no-redef]
         df.show(n, truncate=False)
 
-# fraud rate by country → bar chart or choropleth map
-print("\n[gold_fraud_rate_by_country] → bar chart / map")
-_DISPLAY(spark.table(f"{DB_NAME}.gold_fraud_rate_by_country").orderBy(F.desc("fraud_rate")))
+# COMMAND ----------
 
-# merchant category fraud → bar chart
-print("\n[gold_fraud_by_merchant_category] → bar chart sorted by fraud_rate")
-_DISPLAY(spark.table(f"{DB_NAME}.gold_fraud_by_merchant_category").orderBy(F.desc("fraud_rate")))
+# Chart: bar chart (Keys = transaction_country, Values = fraud_rate) — or map.
+display(
+    spark.table(f"{DB_NAME}.gold_fraud_rate_by_country").orderBy(F.desc("fraud_rate"))
+)
 
-# top risky merchants → table / horizontal bar chart (top N)
-print("\n[gold_top_risky_merchants] → table / horizontal bar chart (top 50)")
-_DISPLAY(spark.table(f"{DB_NAME}.gold_top_risky_merchants").limit(50))
+# COMMAND ----------
 
-# fraud by hour → line chart or hour × day heatmap
-print("\n[gold_fraud_volume_by_hour] → line chart / heatmap")
-_DISPLAY(spark.table(f"{DB_NAME}.gold_fraud_volume_by_hour").orderBy("transaction_hour"))
+# Chart: bar (Keys = merchant_category, Values = fraud_rate).
+display(
+    spark.table(f"{DB_NAME}.gold_fraud_by_merchant_category").orderBy(F.desc("fraud_rate"))
+)
 
-# cross-border → matrix (home_country × transaction_country)
-print("\n[gold_cross_border_activity] → matrix / heatmap")
-_DISPLAY(
+# COMMAND ----------
+
+# Chart: horizontal bar of top 50 (Keys = merchant_name, Values = suspected_fraud_amount).
+display(
+    spark.table(f"{DB_NAME}.gold_top_risky_merchants").limit(50)
+)
+
+# COMMAND ----------
+
+# Chart: line (X = transaction_hour, Y = fraud_rate, second Y = total_transactions).
+display(
+    spark.table(f"{DB_NAME}.gold_fraud_volume_by_hour").orderBy("transaction_hour")
+)
+
+# COMMAND ----------
+
+# Chart: heatmap (rows = home_country, cols = transaction_country, value = suspected_fraud_amount).
+display(
     spark.table(f"{DB_NAME}.gold_cross_border_activity")
     .orderBy(F.desc("suspected_fraud_amount"))
     .limit(100)
 )
 
-# device risk → stacked bar chart by device_type
-print("\n[gold_device_risk_summary] → stacked bar chart")
-_DISPLAY(spark.table(f"{DB_NAME}.gold_device_risk_summary"))
+# COMMAND ----------
 
-# daily trend → line chart of fraud_rate over time
-print("\n[gold_daily_fraud_trend] → line chart")
-_DISPLAY(spark.table(f"{DB_NAME}.gold_daily_fraud_trend").orderBy("transaction_date"))
+# Chart: bar (Keys = device_type, group by rooted/emulator, Values = fraud_rate).
+display(
+    spark.table(f"{DB_NAME}.gold_device_risk_summary")
+)
 
-# DQ dashboard → KPI cards
-print("\n[gold_data_quality_dashboard] → KPI cards")
-_DISPLAY(spark.table(f"{DB_NAME}.gold_data_quality_dashboard"))
+# COMMAND ----------
+
+# Chart: line (X = transaction_date, Y = fraud_rate).
+display(
+    spark.table(f"{DB_NAME}.gold_daily_fraud_trend").orderBy("transaction_date")
+)
+
+# COMMAND ----------
+
+# Chart: counter / KPI cards (single row of metrics).
+display(
+    spark.table(f"{DB_NAME}.gold_data_quality_dashboard")
+)
 
 # COMMAND ----------
 
