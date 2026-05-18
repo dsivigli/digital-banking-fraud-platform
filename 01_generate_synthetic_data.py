@@ -361,8 +361,9 @@ dim_device = (
 # MAGIC ## 6. Persist dimensions as Delta
 # MAGIC
 # MAGIC Dimensions are written first so subsequent FK generation can reference real PK
-# MAGIC ranges. We use `mode("overwrite")` so the notebook is idempotent. Z-ORDERing on
-# MAGIC the PK accelerates point lookups during fraud investigations and joins.
+# MAGIC ranges. We use `mode("overwrite")` so the notebook is idempotent. After each
+# MAGIC write we run `OPTIMIZE ... ZORDER BY` on the join keys so Delta can data-skip
+# MAGIC whole files during point lookups and joins.
 
 # COMMAND ----------
 
@@ -389,6 +390,21 @@ dim_device = (
     .option("overwriteSchema", "true")
     .saveAsTable(f"{DB_NAME}.dim_device")
 )
+
+# Z-ORDER each dimension on its primary key. This co-locates rows with similar PKs
+# in the same files so customer/merchant/device point-lookups read fewer files.
+# Wrapped in try/except because some serverless configurations restrict OPTIMIZE.
+def _try_zorder(table: str, columns: str) -> None:
+    try:
+        spark.sql(f"OPTIMIZE {DB_NAME}.{table} ZORDER BY ({columns})")
+    except Exception as e:
+        # On runtimes where OPTIMIZE/ZORDER isn't permitted (e.g. some serverless
+        # tiers) the write is still complete — we just skip the clustering step.
+        print(f"Skipping ZORDER on {table}: {e}")
+
+_try_zorder("dim_customer", "customer_id")
+_try_zorder("dim_merchant", "merchant_id")
+_try_zorder("dim_device",   "device_id")
 
 # COMMAND ----------
 
@@ -603,6 +619,12 @@ fact_transactions = (
     .partitionBy("event_date")
     .saveAsTable(f"{DB_NAME}.fact_transactions")
 )
+
+# Z-ORDER fact_transactions on (customer_id, merchant_id) within each event_date
+# partition. Most fraud queries filter by date first (partition pruning) and then
+# by customer or merchant — clustering on those keys cuts file reads dramatically.
+# event_date is the partition column and must NOT appear in the ZORDER list.
+_try_zorder("fact_transactions", "customer_id, merchant_id")
 
 # COMMAND ----------
 
