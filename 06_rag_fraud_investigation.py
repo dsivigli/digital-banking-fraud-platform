@@ -67,12 +67,17 @@ CATALOG = "main"
 SCHEMA = "fraud_platform"
 FQ_SCHEMA = f"{CATALOG}.{SCHEMA}"
 
-# Gold tables — engineered, BI-shaped, the trustworthy retrieval surface.
-GOLD_TRANSACTIONS = f"{FQ_SCHEMA}.gold_fact_transactions"
-GOLD_CUSTOMER_FEATURES = f"{FQ_SCHEMA}.gold_customer_fraud_features"
+# Per-transaction context lives in the Silver enriched fact — already joined
+# with customer / merchant / device dim attributes and engineered risk flags.
+# This is the single best row-level source for the prompt.
+SILVER_ENRICHED = f"{FQ_SCHEMA}.silver_fact_transactions_enriched"
+
+# Customer master data — used to enrich beyond what's already on the silver row.
+DIM_CUSTOMER = f"{FQ_SCHEMA}.dim_customer"
+
+# Gold risk surfaces — small, aggregated, fast point lookups.
 GOLD_MERCHANT_RISK = f"{FQ_SCHEMA}.gold_top_risky_merchants"
 GOLD_DEVICE_RISK = f"{FQ_SCHEMA}.gold_device_risk_summary"
-GOLD_IP_RISK = f"{FQ_SCHEMA}.gold_ip_risk_summary"
 
 # Vector Search — fraud policies, SOPs, and prior investigation notes.
 VS_ENDPOINT = "fraud_vs_endpoint"
@@ -148,7 +153,8 @@ class InvestigationResult:
 
 # COMMAND ----------
 
-# Columns the analyst summary genuinely needs. Adjust to your schema.
+# Columns the analyst summary genuinely needs from the silver enriched fact.
+# Trimmed from 50+ columns down to the ones that drive the prompt.
 _TRANSACTION_COLS = [
     "transaction_id",
     "customer_id",
@@ -158,42 +164,66 @@ _TRANSACTION_COLS = [
     "transaction_ts",
     "amount",
     "currency",
+    "transaction_country",
     "merchant_category",
-    "country_code",
+    "merchant_country",
+    "merchant_risk_level",
+    "device_type",
+    "rooted_device_flag",
+    "emulator_flag",
     "is_cross_border",
-    "fraud_label",
+    "is_high_risk_merchant",
+    "is_risky_device",
+    "is_card_not_present",
+    "is_nighttime_transaction",
+    "risk_signal_count",
+    "transaction_status",
 ]
 
 
-def get_transaction_context(transaction_id: str) -> TransactionContext:
-    """Return a single transaction row from the Gold table, or empty if missing."""
-    if not transaction_id or not isinstance(transaction_id, str):
+def get_transaction_context(transaction_id) -> TransactionContext:
+    """Return a single transaction row, or empty if missing.
+
+    Accepts int or string — silver stores transaction_id as bigint.
+    """
+    if transaction_id is None or transaction_id == "":
+        return TransactionContext(transaction_id=str(transaction_id), found=False)
+
+    # Coerce to int when the caller passed a numeric string, so the predicate
+    # doesn't accidentally do a string compare against a bigint column.
+    try:
+        key = int(transaction_id)
+    except (TypeError, ValueError):
         return TransactionContext(transaction_id=str(transaction_id), found=False)
 
     df = (
-        spark.table(GOLD_TRANSACTIONS)
-        .where(F.col("transaction_id") == transaction_id)
+        spark.table(SILVER_ENRICHED)
+        .where(F.col("transaction_id") == F.lit(key))
         .select(*_TRANSACTION_COLS)
         .limit(1)
     )
     rows = df.collect()
     if not rows:
         logger.warning("transaction_not_found id=%s", transaction_id)
-        return TransactionContext(transaction_id=transaction_id, found=False)
+        return TransactionContext(transaction_id=str(transaction_id), found=False)
 
     return TransactionContext(
-        transaction_id=transaction_id,
+        transaction_id=str(transaction_id),
         found=True,
         row=rows[0].asDict(recursive=True),
     )
 
 
-# SQL equivalent (for analysts and for a SQL-native variant of the function):
+# SQL equivalent:
 #
 #   SELECT transaction_id, customer_id, merchant_id, device_id, ip_address,
-#          transaction_ts, amount, currency, merchant_category, country_code,
-#          is_cross_border, fraud_label
-#   FROM   main.fraud_platform.gold_fact_transactions
+#          transaction_ts, amount, currency, transaction_country,
+#          merchant_category, merchant_country, merchant_risk_level,
+#          device_type, rooted_device_flag, emulator_flag,
+#          is_cross_border, is_high_risk_merchant, is_risky_device,
+#          is_card_not_present, is_nighttime_transaction,
+#          risk_signal_count, transaction_status
+#   FROM   main.fraud_platform.silver_fact_transactions_enriched
 #   WHERE  transaction_id = :transaction_id;
 
 # COMMAND ----------
@@ -213,91 +243,122 @@ def get_transaction_context(transaction_id: str) -> TransactionContext:
 
 # COMMAND ----------
 
-_CUSTOMER_FEATURE_COLS = [
+# Customer master attributes from dim_customer. Note the column list will need
+# to match your dim_customer schema — adjust if your dim has different columns.
+_CUSTOMER_COLS = [
     "customer_id",
-    "txn_count_30d",
-    "fraud_count_30d",
-    "fraud_rate_30d",
-    "avg_amount_30d",
-    "distinct_merchants_30d",
-    "distinct_countries_30d",
-    "account_age_days",
-    "kyc_risk_tier",
+    "home_country",
+    "customer_segment",
+    "risk_tier",
+    "is_high_net_worth",
+    "kyc_status",
+    "preferred_channel",
 ]
 
+# gold_top_risky_merchants schema (verified against your workspace):
+# merchant_id, merchant_name, merchant_category, merchant_country,
+# merchant_risk_level, total_transactions, suspected_fraud_transactions,
+# total_amount, suspected_fraud_amount, fraud_rate
 _MERCHANT_RISK_COLS = [
     "merchant_id",
     "merchant_name",
     "merchant_category",
+    "merchant_country",
+    "merchant_risk_level",
+    "total_transactions",
+    "suspected_fraud_transactions",
     "fraud_rate",
-    "txn_count",
-    "risk_tier",
 ]
 
+# gold_device_risk_summary is keyed by (device_type, rooted_device_flag,
+# emulator_flag) — not device_id. Pass the matching attributes from the
+# transaction row to look up the population-level risk for that device profile.
 _DEVICE_RISK_COLS = [
-    "device_id",
-    "distinct_customers",
-    "fraud_rate",
-    "is_emulator",
-    "is_rooted",
-    "first_seen",
-]
-
-_IP_RISK_COLS = [
-    "ip_address",
-    "country_code",
-    "is_tor_exit_node",
-    "is_known_vpn",
+    "device_type",
+    "rooted_device_flag",
+    "emulator_flag",
+    "total_transactions",
+    "suspected_fraud_transactions",
     "fraud_rate",
 ]
 
 
-def _lookup_one(table: str, key_col: str, key_val: Any, cols: list[str]) -> dict[str, Any]:
-    """Single-row Gold lookup. Returns {} if key is None or row absent."""
-    if key_val is None:
+def _lookup_customer(customer_id) -> dict[str, Any]:
+    if customer_id is None:
         return {}
     df = (
-        spark.table(table)
-        .where(F.col(key_col) == key_val)
-        .select(*cols)
+        spark.table(DIM_CUSTOMER)
+        .where(F.col("customer_id") == F.lit(customer_id))
+        .select(*[c for c in _CUSTOMER_COLS if c])
         .limit(1)
     )
     rows = df.collect()
     return rows[0].asDict(recursive=True) if rows else {}
 
 
-def get_entity_context(
-    customer_id: str | None,
-    merchant_id: str | None,
-    device_id: str | None,
-    ip_address: str | None = None,
-) -> EntityContext:
-    """Return enrichment from Gold risk tables for the entities on the transaction."""
+def _lookup_merchant_risk(merchant_id) -> dict[str, Any]:
+    if merchant_id is None:
+        return {}
+    df = (
+        spark.table(GOLD_MERCHANT_RISK)
+        .where(F.col("merchant_id") == F.lit(merchant_id))
+        .select(*_MERCHANT_RISK_COLS)
+        .limit(1)
+    )
+    rows = df.collect()
+    return rows[0].asDict(recursive=True) if rows else {}
+
+
+def _lookup_device_risk(
+    device_type: str | None,
+    rooted: bool | None,
+    emulator: bool | None,
+) -> dict[str, Any]:
+    """Device risk is summarized by *profile*, not per-device id."""
+    if device_type is None:
+        return {}
+    df = (
+        spark.table(GOLD_DEVICE_RISK)
+        .where(F.col("device_type") == F.lit(device_type))
+        .where(F.col("rooted_device_flag") == F.lit(bool(rooted)))
+        .where(F.col("emulator_flag") == F.lit(bool(emulator)))
+        .select(*_DEVICE_RISK_COLS)
+        .limit(1)
+    )
+    rows = df.collect()
+    return rows[0].asDict(recursive=True) if rows else {}
+
+
+def get_entity_context(tx_row: dict[str, Any]) -> EntityContext:
+    """Pull customer / merchant / device enrichment for one transaction row."""
     return EntityContext(
-        customer=_lookup_one(
-            GOLD_CUSTOMER_FEATURES, "customer_id", customer_id, _CUSTOMER_FEATURE_COLS
+        customer=_lookup_customer(tx_row.get("customer_id")),
+        merchant=_lookup_merchant_risk(tx_row.get("merchant_id")),
+        device=_lookup_device_risk(
+            device_type=tx_row.get("device_type"),
+            rooted=tx_row.get("rooted_device_flag"),
+            emulator=tx_row.get("emulator_flag"),
         ),
-        merchant=_lookup_one(
-            GOLD_MERCHANT_RISK, "merchant_id", merchant_id, _MERCHANT_RISK_COLS
-        ),
-        device=_lookup_one(
-            GOLD_DEVICE_RISK, "device_id", device_id, _DEVICE_RISK_COLS
-        ),
-        ip=_lookup_one(GOLD_IP_RISK, "ip_address", ip_address, _IP_RISK_COLS),
+        ip={},  # No IP risk table in this workspace; left empty by design.
     )
 
 
 # SQL equivalents:
 #
-#   SELECT * EXCEPT(_metadata)
-#   FROM main.fraud_platform.gold_customer_fraud_features
-#   WHERE customer_id = :customer_id;
+#   SELECT customer_id, home_country, customer_segment, risk_tier,
+#          is_high_net_worth, kyc_status, preferred_channel
+#   FROM   main.fraud_platform.dim_customer
+#   WHERE  customer_id = :customer_id;
 #
-#   SELECT merchant_id, merchant_name, merchant_category, fraud_rate, txn_count, risk_tier
+#   SELECT merchant_id, merchant_name, merchant_category, merchant_country,
+#          merchant_risk_level, total_transactions, suspected_fraud_transactions, fraud_rate
 #   FROM   main.fraud_platform.gold_top_risky_merchants
 #   WHERE  merchant_id = :merchant_id;
 #
-#   ... and so on for device / ip.
+#   SELECT device_type, rooted_device_flag, emulator_flag, total_transactions,
+#          suspected_fraud_transactions, fraud_rate
+#   FROM   main.fraud_platform.gold_device_risk_summary
+#   WHERE  device_type = :dt AND rooted_device_flag = :rooted AND emulator_flag = :emu;
 
 # COMMAND ----------
 
@@ -358,16 +419,18 @@ def _build_retrieval_query(tx: TransactionContext, ent: EntityContext) -> str:
     r = tx.row
     parts = [
         f"merchant_category={r.get('merchant_category')}",
-        f"country={r.get('country_code')}",
+        f"country={r.get('transaction_country')}",
         f"cross_border={r.get('is_cross_border')}",
         f"amount_band={'high' if (r.get('amount') or 0) >= 10000 else 'normal'}",
     ]
-    if ent.merchant.get("risk_tier"):
-        parts.append(f"merchant_risk_tier={ent.merchant['risk_tier']}")
-    if ent.device.get("is_emulator"):
-        parts.append("device_emulator=true")
-    if ent.ip.get("is_tor_exit_node"):
-        parts.append("ip_tor=true")
+    if r.get("is_high_risk_merchant"):
+        parts.append("high_risk_merchant=true")
+    if r.get("is_risky_device") or r.get("emulator_flag") or r.get("rooted_device_flag"):
+        parts.append("risky_device=true")
+    if r.get("is_card_not_present"):
+        parts.append("card_not_present=true")
+    if r.get("is_nighttime_transaction"):
+        parts.append("nighttime=true")
     return " ".join(parts)
 
 
@@ -520,14 +583,7 @@ def investigate_transaction(transaction_id: str, k: int = 5) -> InvestigationRes
         _audit(result, prompt="(skipped: tx not found)")
         return result
 
-    r = tx.row
-    ent = get_entity_context(
-        customer_id=r.get("customer_id"),
-        merchant_id=r.get("merchant_id"),
-        device_id=r.get("device_id"),
-        ip_address=r.get("ip_address"),
-    )
-
+    ent = get_entity_context(tx.row)
     query = _build_retrieval_query(tx, ent)
     chunks = retrieve_policy_context(query, k=k)
 

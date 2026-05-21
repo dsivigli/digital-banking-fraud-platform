@@ -38,20 +38,21 @@ print("Audit table:", AUDIT_TABLE)
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 1. Pick representative transaction IDs from Gold
+# MAGIC ## 1. Pick representative transaction IDs from the Silver enriched fact
 # MAGIC
-# MAGIC Pulling real ids beats hard-coding strings — the test stays valid as the
-# MAGIC data evolves. Three buckets so we exercise different prompt shapes:
+# MAGIC Pulling real ids beats hard-coding — the test stays valid as data evolves.
+# MAGIC The proxy fraud signal in this lakehouse is `risk_signal_count >= 3`
+# MAGIC (see `03_gold_layer.py`), so we use that to find a "fraud-like" example.
 # MAGIC
-# MAGIC - **fraud**: `fraud_label = 1` — the model should recommend ESCALATE / SAR.
-# MAGIC - **clean**: `fraud_label = 0` and unremarkable — should recommend APPROVE.
-# MAGIC - **cross-border**: `is_cross_border = true` — exercises the AML policy chunks.
+# MAGIC - **risky**: `risk_signal_count >= 3` — model should recommend ESCALATE / HOLD.
+# MAGIC - **clean**: zero risk signals, not cross-border — model should APPROVE.
+# MAGIC - **cross-border**: `is_cross_border = true` — exercises AML policy chunks.
 
 # COMMAND ----------
 
 from pyspark.sql import functions as F
 
-gold_tx = spark.table(GOLD_TRANSACTIONS)
+silver_tx = spark.table(SILVER_ENRICHED)
 
 def _pick_one(df, predicate, label):
     rows = df.where(predicate).select("transaction_id").limit(1).collect()
@@ -60,16 +61,16 @@ def _pick_one(df, predicate, label):
         return None
     return rows[0]["transaction_id"]
 
-ID_FRAUD = _pick_one(gold_tx, F.col("fraud_label") == 1, "fraud")
+ID_RISKY = _pick_one(silver_tx, F.col("risk_signal_count") >= 3, "risky")
 ID_CLEAN = _pick_one(
-    gold_tx,
-    (F.col("fraud_label") == 0) & (F.col("is_cross_border") == False),
+    silver_tx,
+    (F.col("risk_signal_count") == 0) & (F.col("is_cross_border") == False),
     "clean",
 )
-ID_CROSS_BORDER = _pick_one(gold_tx, F.col("is_cross_border") == True, "cross-border")
-ID_MISSING = "txn_does_not_exist_xxxxxx"
+ID_CROSS_BORDER = _pick_one(silver_tx, F.col("is_cross_border") == True, "cross-border")
+ID_MISSING = -1  # bigint id that won't exist
 
-print({"fraud": ID_FRAUD, "clean": ID_CLEAN, "cross_border": ID_CROSS_BORDER})
+print({"risky": ID_RISKY, "clean": ID_CLEAN, "cross_border": ID_CROSS_BORDER})
 
 # COMMAND ----------
 
@@ -82,8 +83,8 @@ print({"fraud": ID_FRAUD, "clean": ID_CLEAN, "cross_border": ID_CROSS_BORDER})
 # COMMAND ----------
 
 # 2a. Transaction lookup — happy path.
-tx = get_transaction_context(ID_FRAUD)
-assert tx.found, "expected to find the fraud transaction"
+tx = get_transaction_context(ID_RISKY)
+assert tx.found, "expected to find the risky transaction"
 print(f"transaction_id={tx.transaction_id} customer={tx.row.get('customer_id')} merchant={tx.row.get('merchant_id')}")
 tx.row
 
@@ -96,17 +97,11 @@ print("OK — refusal path engaged for missing id")
 
 # COMMAND ----------
 
-# 2c. Entity lookup — populated from the fraud transaction.
-ent = get_entity_context(
-    customer_id=tx.row.get("customer_id"),
-    merchant_id=tx.row.get("merchant_id"),
-    device_id=tx.row.get("device_id"),
-    ip_address=tx.row.get("ip_address"),
-)
+# 2c. Entity lookup — built from the transaction row.
+ent = get_entity_context(tx.row)
 print("customer:", ent.customer)
 print("merchant:", ent.merchant)
 print("device:  ", ent.device)
-print("ip:      ", ent.ip)
 
 # COMMAND ----------
 
@@ -132,8 +127,8 @@ def _show(label, result):
     print(result.answer)
     print()
 
-if ID_FRAUD:
-    _show("FRAUD", investigate_transaction(ID_FRAUD))
+if ID_RISKY:
+    _show("RISKY", investigate_transaction(ID_RISKY))
 
 if ID_CLEAN:
     _show("CLEAN", investigate_transaction(ID_CLEAN))
@@ -199,7 +194,7 @@ audit.show(truncate=False)
 # r = requests.post(
 #     f"{APP_URL}/investigate",
 #     headers={"Authorization": f"Bearer {DATABRICKS_TOKEN}"},
-#     json={"transaction_id": ID_FRAUD, "k": 5},
+#     json={"transaction_id": str(ID_RISKY), "k": 5},
 #     timeout=60,
 # )
 # r.raise_for_status()
