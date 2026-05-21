@@ -55,8 +55,27 @@ def _try_set(key: str, value: str) -> None:
 _try_set("spark.sql.adaptive.enabled", "true")
 _try_set("spark.sql.adaptive.skewJoin.enabled", "true")
 
-DB_NAME = "fraud_platform"
-spark.sql(f"USE {DB_NAME}")
+# Unity Catalog three-level naming: catalog.schema.table.
+CATALOG = "main"
+SCHEMA = "fraud_platform"
+FQ_SCHEMA = f"{CATALOG}.{SCHEMA}"
+
+spark.sql(f"USE CATALOG {CATALOG}")
+spark.sql(f"USE SCHEMA {SCHEMA}")
+
+# UC Volume for non-tabular artifacts (trained model files). Volumes are the
+# governed alternative to /tmp or raw cloud paths — they enforce the same
+# permissions model as tables. We try to create the volume; if the user lacks
+# CREATE VOLUME or it already exists at a different state, we fall back to /tmp
+# so local/non-UC runs still work.
+VOLUME = "ml_artifacts"
+FQ_VOLUME = f"{FQ_SCHEMA}.{VOLUME}"
+try:
+    spark.sql(f"CREATE VOLUME IF NOT EXISTS {FQ_VOLUME}")
+    MODEL_BASE_PATH = f"/Volumes/{CATALOG}/{SCHEMA}/{VOLUME}"
+except Exception as e:
+    print(f"UC Volume not available ({e}); falling back to /tmp")
+    MODEL_BASE_PATH = "/tmp/fraud_platform"
 
 # Reproducibility seed. Single source of truth — every random op uses this so
 # train/test splits, model init, and undersampling are bit-identical across runs.
@@ -72,7 +91,7 @@ SEED = 42
 
 # COMMAND ----------
 
-ft = spark.table(f"{DB_NAME}.ml_transaction_fraud_features")
+ft = spark.table(f"{FQ_SCHEMA}.ml_transaction_fraud_features")
 
 print("=" * 80)
 print("ml_transaction_fraud_features — schema")
@@ -530,10 +549,11 @@ metrics_table.show(truncate=False)
 
 import os
 
-# Models are saved to DBFS (or workspace files outside Databricks). The path
-# pattern below works on both. Pipelines round-trip exactly via load().
-LR_MODEL_PATH = "/tmp/fraud_platform/ml_fraud_model_logistic"
-RF_MODEL_PATH = "/tmp/fraud_platform/ml_fraud_model_rf"
+# Models are saved to a UC Volume (governed file storage) when available, with
+# a /tmp fallback for non-UC runs. MODEL_BASE_PATH is set in the config block
+# above based on whether the volume could be created.
+LR_MODEL_PATH = f"{MODEL_BASE_PATH}/ml_fraud_model_logistic"
+RF_MODEL_PATH = f"{MODEL_BASE_PATH}/ml_fraud_model_rf"
 
 lr_model.write().overwrite().save(LR_MODEL_PATH)
 rf_model.write().overwrite().save(RF_MODEL_PATH)
@@ -548,7 +568,7 @@ print(f"Saved RF model → {RF_MODEL_PATH}")
     .format("delta")
     .mode("overwrite")
     .option("overwriteSchema", "true")
-    .saveAsTable(f"{DB_NAME}.ml_fraud_model_metrics")
+    .saveAsTable(f"{FQ_SCHEMA}.ml_fraud_model_metrics")
 )
 
 # COMMAND ----------
@@ -579,7 +599,7 @@ scored = (
     .mode("overwrite")
     .option("overwriteSchema", "true")
     .partitionBy("event_date")
-    .saveAsTable(f"{DB_NAME}.ml_fraud_scored_transactions")
+    .saveAsTable(f"{FQ_SCHEMA}.ml_fraud_scored_transactions")
 )
 
 # COMMAND ----------

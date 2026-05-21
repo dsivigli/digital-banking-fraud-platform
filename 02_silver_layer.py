@@ -57,8 +57,15 @@ _try_set("spark.sql.adaptive.enabled", "true")
 _try_set("spark.sql.adaptive.skewJoin.enabled", "true")
 _try_set("spark.sql.adaptive.coalescePartitions.enabled", "true")
 
-DB_NAME = "fraud_platform"
-spark.sql(f"USE {DB_NAME}")
+# Unity Catalog three-level naming: catalog.schema.table. See notebook 01 for
+# the rationale; we re-declare the constants here so each notebook runs in
+# isolation without depending on a shared session.
+CATALOG = "main"
+SCHEMA = "fraud_platform"
+FQ_SCHEMA = f"{CATALOG}.{SCHEMA}"
+
+spark.sql(f"USE CATALOG {CATALOG}")
+spark.sql(f"USE SCHEMA {SCHEMA}")
 
 # Allow lists — declared once, broadcast as Spark literals so the predicates run
 # entirely in Catalyst (no per-row Python interop).
@@ -72,10 +79,10 @@ ALLOWED_STATUSES = ["APPROVED", "DECLINED", "PENDING"]
 
 # COMMAND ----------
 
-bronze = spark.table(f"{DB_NAME}.bronze_fact_transactions_dirty")
-dim_customer = spark.table(f"{DB_NAME}.dim_customer")
-dim_merchant = spark.table(f"{DB_NAME}.dim_merchant")
-dim_device = spark.table(f"{DB_NAME}.dim_device")
+bronze = spark.table(f"{FQ_SCHEMA}.bronze_fact_transactions_dirty")
+dim_customer = spark.table(f"{FQ_SCHEMA}.dim_customer")
+dim_merchant = spark.table(f"{FQ_SCHEMA}.dim_merchant")
+dim_device = spark.table(f"{FQ_SCHEMA}.dim_device")
 
 print("=" * 80)
 print("bronze_fact_transactions_dirty — schema")
@@ -582,7 +589,7 @@ silver_data_quality_summary = summary_scalars.crossJoin(flag_counts)
     .mode("overwrite")
     .option("overwriteSchema", "true")
     .partitionBy("event_date")
-    .saveAsTable(f"{DB_NAME}.silver_fact_transactions_clean")
+    .saveAsTable(f"{FQ_SCHEMA}.silver_fact_transactions_clean")
 )
 
 (
@@ -591,7 +598,7 @@ silver_data_quality_summary = summary_scalars.crossJoin(flag_counts)
     .mode("overwrite")
     .option("overwriteSchema", "true")
     .partitionBy("event_date")
-    .saveAsTable(f"{DB_NAME}.quarantine_bad_transactions")
+    .saveAsTable(f"{FQ_SCHEMA}.quarantine_bad_transactions")
 )
 
 (
@@ -600,7 +607,7 @@ silver_data_quality_summary = summary_scalars.crossJoin(flag_counts)
     .mode("overwrite")
     .option("overwriteSchema", "true")
     .partitionBy("event_date")
-    .saveAsTable(f"{DB_NAME}.silver_fact_transactions_enriched")
+    .saveAsTable(f"{FQ_SCHEMA}.silver_fact_transactions_enriched")
 )
 
 (
@@ -608,7 +615,7 @@ silver_data_quality_summary = summary_scalars.crossJoin(flag_counts)
     .format("delta")
     .mode("overwrite")
     .option("overwriteSchema", "true")
-    .saveAsTable(f"{DB_NAME}.silver_data_quality_summary")
+    .saveAsTable(f"{FQ_SCHEMA}.silver_data_quality_summary")
 )
 
 # Release the cache now that all writes are committed. unpersist() is a no-op
@@ -628,15 +635,15 @@ except Exception:
 print("=" * 80)
 print("silver_fact_transactions_clean — sample")
 print("=" * 80)
-spark.table(f"{DB_NAME}.silver_fact_transactions_clean").printSchema()
-spark.table(f"{DB_NAME}.silver_fact_transactions_clean").show(5, truncate=False)
+spark.table(f"{FQ_SCHEMA}.silver_fact_transactions_clean").printSchema()
+spark.table(f"{FQ_SCHEMA}.silver_fact_transactions_clean").show(5, truncate=False)
 
 print("=" * 80)
 print("quarantine_bad_transactions — sample")
 print("=" * 80)
-spark.table(f"{DB_NAME}.quarantine_bad_transactions").printSchema()
+spark.table(f"{FQ_SCHEMA}.quarantine_bad_transactions").printSchema()
 (
-    spark.table(f"{DB_NAME}.quarantine_bad_transactions")
+    spark.table(f"{FQ_SCHEMA}.quarantine_bad_transactions")
     .select("transaction_id", "customer_id", "merchant_id", "amount",
             "currency", "transaction_status", "transaction_ts", "ingestion_ts",
             "quarantine_reason", "quarantine_ts")
@@ -645,7 +652,7 @@ spark.table(f"{DB_NAME}.quarantine_bad_transactions").printSchema()
 
 print("Quarantine reason breakdown:")
 (
-    spark.table(f"{DB_NAME}.quarantine_bad_transactions")
+    spark.table(f"{FQ_SCHEMA}.quarantine_bad_transactions")
     .groupBy("quarantine_reason")
     .count()
     .orderBy(F.desc("count"))
@@ -655,9 +662,9 @@ print("Quarantine reason breakdown:")
 print("=" * 80)
 print("silver_fact_transactions_enriched — sample")
 print("=" * 80)
-spark.table(f"{DB_NAME}.silver_fact_transactions_enriched").printSchema()
+spark.table(f"{FQ_SCHEMA}.silver_fact_transactions_enriched").printSchema()
 (
-    spark.table(f"{DB_NAME}.silver_fact_transactions_enriched")
+    spark.table(f"{FQ_SCHEMA}.silver_fact_transactions_enriched")
     .select("transaction_id", "customer_id", "merchant_id", "amount",
             "transaction_country", "home_country", "merchant_category",
             "is_cross_border", "is_high_risk_merchant", "is_risky_device",
@@ -669,7 +676,7 @@ spark.table(f"{DB_NAME}.silver_fact_transactions_enriched").printSchema()
 print("=" * 80)
 print("silver_data_quality_summary")
 print("=" * 80)
-spark.table(f"{DB_NAME}.silver_data_quality_summary").show(truncate=False, vertical=True)
+spark.table(f"{FQ_SCHEMA}.silver_data_quality_summary").show(truncate=False, vertical=True)
 
 # COMMAND ----------
 

@@ -61,8 +61,13 @@ def _try_set(key: str, value: str) -> None:
 _try_set("spark.sql.adaptive.enabled", "true")
 _try_set("spark.sql.adaptive.skewJoin.enabled", "true")
 
-DB_NAME = "fraud_platform"
-spark.sql(f"USE {DB_NAME}")
+# Unity Catalog three-level naming: catalog.schema.table.
+CATALOG = "main"
+SCHEMA = "fraud_platform"
+FQ_SCHEMA = f"{CATALOG}.{SCHEMA}"
+
+spark.sql(f"USE CATALOG {CATALOG}")
+spark.sql(f"USE SCHEMA {SCHEMA}")
 
 # Time window sizes in seconds. Using seconds (not days/hours) makes the
 # rangeBetween math precise and matches the unix_timestamp ordering column.
@@ -84,14 +89,14 @@ SECONDS_30D = 30 * SECONDS_24H
 
 # COMMAND ----------
 
-silver = spark.table(f"{DB_NAME}.silver_fact_transactions_enriched")
+silver = spark.table(f"{FQ_SCHEMA}.silver_fact_transactions_enriched")
 
 # fraud_labels may not exist yet on a fresh deployment — synthesize a stub so
 # the notebook is self-contained for the exercise. The stub is empty (no labels)
 # which exercises the "missing label → 0" code path without injecting bias.
 def _load_or_stub_fraud_labels():
-    if spark.catalog.tableExists(f"{DB_NAME}.fraud_labels"):
-        return spark.table(f"{DB_NAME}.fraud_labels").select(
+    if spark.catalog.tableExists(f"{FQ_SCHEMA}.fraud_labels"):
+        return spark.table(f"{FQ_SCHEMA}.fraud_labels").select(
             F.col("transaction_id").cast("long").alias("transaction_id"),
             F.col("fraud_label").cast("int").alias("fraud_label"),
         )
@@ -385,7 +390,7 @@ ml_transaction_fraud_features = features.select(
     .mode("overwrite")
     .option("overwriteSchema", "true")
     .partitionBy("event_date")
-    .saveAsTable(f"{DB_NAME}.ml_transaction_fraud_features")
+    .saveAsTable(f"{FQ_SCHEMA}.ml_transaction_fraud_features")
 )
 
 # COMMAND ----------
@@ -395,7 +400,7 @@ ml_transaction_fraud_features = features.select(
 
 # COMMAND ----------
 
-ft = spark.table(f"{DB_NAME}.ml_transaction_fraud_features")
+ft = spark.table(f"{FQ_SCHEMA}.ml_transaction_fraud_features")
 
 print("=" * 80)
 print("ml_transaction_fraud_features — schema")

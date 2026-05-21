@@ -85,10 +85,20 @@ N_MERCHANTS = 100_000          # 100k merchants
 N_DEVICES = 5_000_000          # 5M devices (more devices than customers — multi-device users)
 N_TRANSACTIONS = 50_000_000    # 50M transactions; bump to 500_000_000 for stress tests
 
-# Database / catalog. In Databricks Unity Catalog this would be `catalog.schema`.
-DB_NAME = "fraud_platform"
-spark.sql(f"CREATE DATABASE IF NOT EXISTS {DB_NAME}")
-spark.sql(f"USE {DB_NAME}")
+# Unity Catalog three-level naming: catalog.schema.table.
+# CATALOG and SCHEMA are kept as separate constants so a different deployment
+# (e.g. dev/staging/prod) can override them without touching downstream code.
+# FQ_SCHEMA is the fully qualified `catalog.schema` prefix used everywhere we
+# reference a table — equivalent to the old `DB_NAME` but UC-safe.
+CATALOG = "main"
+SCHEMA = "fraud_platform"
+FQ_SCHEMA = f"{CATALOG}.{SCHEMA}"
+
+# Make the catalog active so unqualified `USE SCHEMA` resolves correctly. UC
+# also requires the user to hold USE CATALOG / USE SCHEMA on these objects.
+spark.sql(f"USE CATALOG {CATALOG}")
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {FQ_SCHEMA}")
+spark.sql(f"USE SCHEMA {SCHEMA}")
 
 # Partition counts. Rule of thumb: keep each partition ~128–256 MB after generation.
 # spark.range() defaults to spark.default.parallelism which is often too low for
@@ -372,7 +382,7 @@ dim_device = (
     .format("delta")
     .mode("overwrite")
     .option("overwriteSchema", "true")
-    .saveAsTable(f"{DB_NAME}.dim_customer")
+    .saveAsTable(f"{FQ_SCHEMA}.dim_customer")
 )
 
 (
@@ -380,7 +390,7 @@ dim_device = (
     .format("delta")
     .mode("overwrite")
     .option("overwriteSchema", "true")
-    .saveAsTable(f"{DB_NAME}.dim_merchant")
+    .saveAsTable(f"{FQ_SCHEMA}.dim_merchant")
 )
 
 (
@@ -388,7 +398,7 @@ dim_device = (
     .format("delta")
     .mode("overwrite")
     .option("overwriteSchema", "true")
-    .saveAsTable(f"{DB_NAME}.dim_device")
+    .saveAsTable(f"{FQ_SCHEMA}.dim_device")
 )
 
 # Z-ORDER each dimension on its primary key. This co-locates rows with similar PKs
@@ -396,7 +406,7 @@ dim_device = (
 # Wrapped in try/except because some serverless configurations restrict OPTIMIZE.
 def _try_zorder(table: str, columns: str) -> None:
     try:
-        spark.sql(f"OPTIMIZE {DB_NAME}.{table} ZORDER BY ({columns})")
+        spark.sql(f"OPTIMIZE {FQ_SCHEMA}.{table} ZORDER BY ({columns})")
     except Exception as e:
         # On runtimes where OPTIMIZE/ZORDER isn't permitted (e.g. some serverless
         # tiers) the write is still complete — we just skip the clustering step.
@@ -630,11 +640,11 @@ def _write_fact_liquid_or_partitioned(df, table: str, cluster_cols: list[str]) -
             .mode("overwrite")
             .option("overwriteSchema", "true")
             .clusterBy(*cluster_cols)
-            .saveAsTable(f"{DB_NAME}.{table}")
+            .saveAsTable(f"{FQ_SCHEMA}.{table}")
         )
         # Trigger initial clustering. Liquid tables require OPTIMIZE to actually
         # cluster — clusterBy on write only declares the intent.
-        spark.sql(f"OPTIMIZE {DB_NAME}.{table}")
+        spark.sql(f"OPTIMIZE {FQ_SCHEMA}.{table}")
         print(f"{table}: written with Liquid Clustering on {cluster_cols}")
     except Exception as e:
         # Fallback path: partition by event_date, Z-ORDER on the remaining keys.
@@ -646,7 +656,7 @@ def _write_fact_liquid_or_partitioned(df, table: str, cluster_cols: list[str]) -
             .mode("overwrite")
             .option("overwriteSchema", "true")
             .partitionBy("event_date")
-            .saveAsTable(f"{DB_NAME}.{table}")
+            .saveAsTable(f"{FQ_SCHEMA}.{table}")
         )
         zorder_cols = ", ".join(c for c in cluster_cols if c != "event_date")
         if zorder_cols:
@@ -671,26 +681,26 @@ _write_fact_liquid_or_partitioned(
 print("=" * 80)
 print("dim_customer — schema & sample")
 print("=" * 80)
-spark.table(f"{DB_NAME}.dim_customer").printSchema()
-spark.table(f"{DB_NAME}.dim_customer").show(5, truncate=False)
+spark.table(f"{FQ_SCHEMA}.dim_customer").printSchema()
+spark.table(f"{FQ_SCHEMA}.dim_customer").show(5, truncate=False)
 
 print("=" * 80)
 print("dim_merchant — schema & sample")
 print("=" * 80)
-spark.table(f"{DB_NAME}.dim_merchant").printSchema()
-spark.table(f"{DB_NAME}.dim_merchant").show(5, truncate=False)
+spark.table(f"{FQ_SCHEMA}.dim_merchant").printSchema()
+spark.table(f"{FQ_SCHEMA}.dim_merchant").show(5, truncate=False)
 
 print("=" * 80)
 print("dim_device — schema & sample")
 print("=" * 80)
-spark.table(f"{DB_NAME}.dim_device").printSchema()
-spark.table(f"{DB_NAME}.dim_device").show(5, truncate=False)
+spark.table(f"{FQ_SCHEMA}.dim_device").printSchema()
+spark.table(f"{FQ_SCHEMA}.dim_device").show(5, truncate=False)
 
 print("=" * 80)
 print("fact_transactions — schema & sample")
 print("=" * 80)
-spark.table(f"{DB_NAME}.fact_transactions").printSchema()
-spark.table(f"{DB_NAME}.fact_transactions").show(5, truncate=False)
+spark.table(f"{FQ_SCHEMA}.fact_transactions").printSchema()
+spark.table(f"{FQ_SCHEMA}.fact_transactions").show(5, truncate=False)
 
 # COMMAND ----------
 
@@ -708,7 +718,7 @@ spark.table(f"{DB_NAME}.fact_transactions").show(5, truncate=False)
 
 # FK domain check — aggregation reduces 50M rows to one. .first() is safe here.
 fk_bounds = (
-    spark.table(f"{DB_NAME}.fact_transactions")
+    spark.table(f"{FQ_SCHEMA}.fact_transactions")
     .agg(
         F.min("customer_id").alias("min_customer_id"),
         F.max("customer_id").alias("max_customer_id"),
@@ -722,7 +732,7 @@ fk_bounds.show(truncate=False)
 
 # Skew check — show top-10 merchants by volume. Aggregation + LIMIT, never a full collect.
 (
-    spark.table(f"{DB_NAME}.fact_transactions")
+    spark.table(f"{FQ_SCHEMA}.fact_transactions")
     .groupBy("merchant_id")
     .count()
     .orderBy(F.desc("count"))
@@ -822,7 +832,7 @@ fk_bounds.show(truncate=False)
 # COMMAND ----------
 
 # Read the clean fact table generated above.
-fact_clean = spark.table(f"{DB_NAME}.fact_transactions")
+fact_clean = spark.table(f"{FQ_SCHEMA}.fact_transactions")
 
 # Add ingestion_ts: when the transaction *arrived* in the warehouse. For most
 # rows this is transaction_ts + a small random delay (0..600 seconds). The
@@ -1053,12 +1063,12 @@ bronze_dirty = bronze_mutated.unionByName(duplicates)
     .mode("overwrite")
     .option("overwriteSchema", "true")
     .partitionBy("event_date")
-    .saveAsTable(f"{DB_NAME}.bronze_fact_transactions_dirty")
+    .saveAsTable(f"{FQ_SCHEMA}.bronze_fact_transactions_dirty")
 )
 
 print("Bronze issue-type distribution (groupBy reduce — never a full collect):")
 (
-    spark.table(f"{DB_NAME}.bronze_fact_transactions_dirty")
+    spark.table(f"{FQ_SCHEMA}.bronze_fact_transactions_dirty")
     .groupBy("data_quality_issue_type")
     .count()
     .orderBy(F.desc("count"))
@@ -1075,12 +1085,12 @@ print("Bronze issue-type distribution (groupBy reduce — never a full collect):
 print("=" * 80)
 print("bronze_fact_transactions_dirty — schema & sample")
 print("=" * 80)
-spark.table(f"{DB_NAME}.bronze_fact_transactions_dirty").printSchema()
+spark.table(f"{FQ_SCHEMA}.bronze_fact_transactions_dirty").printSchema()
 
 # Show one example of each issue type. groupBy + first() is a reduce — safe.
 print("One sample row per issue type:")
 (
-    spark.table(f"{DB_NAME}.bronze_fact_transactions_dirty")
+    spark.table(f"{FQ_SCHEMA}.bronze_fact_transactions_dirty")
     .select("transaction_id", "customer_id", "merchant_id", "device_id",
             "amount", "currency", "transaction_country", "transaction_status",
             "transaction_ts", "ingestion_ts", "data_quality_issue_type")

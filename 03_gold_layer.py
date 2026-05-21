@@ -55,8 +55,13 @@ def _try_set(key: str, value: str) -> None:
 _try_set("spark.sql.adaptive.enabled", "true")
 _try_set("spark.sql.adaptive.skewJoin.enabled", "true")
 
-DB_NAME = "fraud_platform"
-spark.sql(f"USE {DB_NAME}")
+# Unity Catalog three-level naming: catalog.schema.table.
+CATALOG = "main"
+SCHEMA = "fraud_platform"
+FQ_SCHEMA = f"{CATALOG}.{SCHEMA}"
+
+spark.sql(f"USE CATALOG {CATALOG}")
+spark.sql(f"USE SCHEMA {SCHEMA}")
 
 # COMMAND ----------
 
@@ -65,9 +70,9 @@ spark.sql(f"USE {DB_NAME}")
 
 # COMMAND ----------
 
-silver_enriched = spark.table(f"{DB_NAME}.silver_fact_transactions_enriched")
-quarantine = spark.table(f"{DB_NAME}.quarantine_bad_transactions")
-dq_summary = spark.table(f"{DB_NAME}.silver_data_quality_summary")
+silver_enriched = spark.table(f"{FQ_SCHEMA}.silver_fact_transactions_enriched")
+quarantine = spark.table(f"{FQ_SCHEMA}.quarantine_bad_transactions")
+dq_summary = spark.table(f"{FQ_SCHEMA}.silver_data_quality_summary")
 
 print("=" * 80)
 print("silver_fact_transactions_enriched — schema")
@@ -446,7 +451,7 @@ for table_name, df in GOLD_TABLES:
         .format("delta")
         .mode("overwrite")
         .option("overwriteSchema", "true")
-        .saveAsTable(f"{DB_NAME}.{table_name}")
+        .saveAsTable(f"{FQ_SCHEMA}.{table_name}")
     )
 
 # COMMAND ----------
@@ -478,35 +483,35 @@ except NameError:
 
 # Chart: bar chart (Keys = transaction_country, Values = fraud_rate) — or map.
 display(
-    spark.table(f"{DB_NAME}.gold_fraud_rate_by_country").orderBy(F.desc("fraud_rate"))
+    spark.table(f"{FQ_SCHEMA}.gold_fraud_rate_by_country").orderBy(F.desc("fraud_rate"))
 )
 
 # COMMAND ----------
 
 # Chart: bar (Keys = merchant_category, Values = fraud_rate).
 display(
-    spark.table(f"{DB_NAME}.gold_fraud_by_merchant_category").orderBy(F.desc("fraud_rate"))
+    spark.table(f"{FQ_SCHEMA}.gold_fraud_by_merchant_category").orderBy(F.desc("fraud_rate"))
 )
 
 # COMMAND ----------
 
 # Chart: horizontal bar of top 50 (Keys = merchant_name, Values = suspected_fraud_amount).
 display(
-    spark.table(f"{DB_NAME}.gold_top_risky_merchants").limit(50)
+    spark.table(f"{FQ_SCHEMA}.gold_top_risky_merchants").limit(50)
 )
 
 # COMMAND ----------
 
 # Chart: line (X = transaction_hour, Y = fraud_rate, second Y = total_transactions).
 display(
-    spark.table(f"{DB_NAME}.gold_fraud_volume_by_hour").orderBy("transaction_hour")
+    spark.table(f"{FQ_SCHEMA}.gold_fraud_volume_by_hour").orderBy("transaction_hour")
 )
 
 # COMMAND ----------
 
 # Chart: heatmap (rows = home_country, cols = transaction_country, value = suspected_fraud_amount).
 display(
-    spark.table(f"{DB_NAME}.gold_cross_border_activity")
+    spark.table(f"{FQ_SCHEMA}.gold_cross_border_activity")
     .orderBy(F.desc("suspected_fraud_amount"))
     .limit(100)
 )
@@ -515,21 +520,21 @@ display(
 
 # Chart: bar (Keys = device_type, group by rooted/emulator, Values = fraud_rate).
 display(
-    spark.table(f"{DB_NAME}.gold_device_risk_summary")
+    spark.table(f"{FQ_SCHEMA}.gold_device_risk_summary")
 )
 
 # COMMAND ----------
 
 # Chart: line (X = transaction_date, Y = fraud_rate).
 display(
-    spark.table(f"{DB_NAME}.gold_daily_fraud_trend").orderBy("transaction_date")
+    spark.table(f"{FQ_SCHEMA}.gold_daily_fraud_trend").orderBy("transaction_date")
 )
 
 # COMMAND ----------
 
 # Chart: counter / KPI cards (single row of metrics).
 display(
-    spark.table(f"{DB_NAME}.gold_data_quality_dashboard")
+    spark.table(f"{FQ_SCHEMA}.gold_data_quality_dashboard")
 )
 
 # COMMAND ----------
