@@ -28,6 +28,18 @@
 
 # MAGIC %md
 # MAGIC ## 0. Setup
+# MAGIC
+# MAGIC `databricks-vectorsearch` and `databricks-sdk` are not preinstalled on most
+# MAGIC standard clusters. Install at notebook scope (no cluster restart needed)
+# MAGIC and restart Python so the new packages are picked up.
+
+# COMMAND ----------
+
+# MAGIC %pip install --quiet databricks-vectorsearch databricks-sdk
+
+# COMMAND ----------
+
+dbutils.library.restartPython()
 
 # COMMAND ----------
 
